@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Воздушная экспедиция • Пульт ведущего</title>
+<link rel="stylesheet" href="styles.css">
+<script src="config.js"></script>
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand"><span class="logo">✈</span><span>Воздушная экспедиция</span></div>
+    <div class="top-actions">
+      <span class="badge" id="connBadge">подключение…</span>
+      <button class="icon-btn" id="themeBtn" aria-label="Тема">◐</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="stage">
+      <div class="screen" id="lobbyScreen">
+        <h2>Создание игры</h2>
+        <p class="hint">Задайте 2–6 команд. Код сессии и PIN-коды будут сгенерированы.</p>
+        <div class="field">
+          <label>Названия команд (по одной в строке)</label>
+          <textarea id="teamNamesInput" rows="6" placeholder="Команда 1&#10;Команда 2"></textarea>
+        </div>
+        <button class="btn primary" id="createBtn" disabled>Создать сессию</button>
+        <div id="sessionInfo" class="session-info" hidden>
+          <h3>Код сессии: <span id="sessionCode"></span></h3>
+          <div id="teamPins"></div>
+          <button class="btn primary" id="startBtn">Начать игру (жеребьёвка)</button>
+          <p class="hint">После старта команды по очереди выбирают самолёт на своих пультах.</p>
+        </div>
+      </div>
+
+      <div class="screen" id="gameScreen" hidden>
+        <div class="stage-head">
+          <span class="eyebrow" id="stageLabel">Этап</span>
+          <h2 id="stageTitle"></h2>
+        </div>
+
+        <div class="controls">
+          <button class="btn" id="nextStageBtn">Далее →</button>
+          <button class="btn" id="revealBtn">Показать последствия</button>
+        </div>
+
+        <div class="roll-box" id="rollBox" hidden>
+          <button class="btn primary" id="rollBtn">🎲 Бросить кубик</button>
+          <div id="rollResult" class="roll-result"></div>
+        </div>
+
+        <div class="timer-box">
+          <span>Таймер этапа:</span>
+          <select id="timerMin">
+            <option value="3">3 мин</option>
+            <option value="5" selected>5 мин</option>
+            <option value="10">10 мин</option>
+          </select>
+          <button class="btn" id="timerStartBtn">Старт</button>
+          <span id="timerDisplay" class="timer-display">—</span>
+        </div>
+
+        <div class="teams-status" id="teamsStatus"></div>
+
+        <div class="trade-review" id="tradeReview" hidden>
+          <h3>Сделки</h3>
+          <div id="tradeList"></div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="side">
+      <div class="side-head"><h2>Пульт ведущего</h2></div>
+      <div class="editor">
+        <p class="hint">Ведущий управляет этапами, кубиком и таймером. Решения вводят команды на своих пультах.</p>
+        <div class="links">
+          <p><a href="screen.html?code=" target="_blank" id="screenLink">Открыть экран проектора</a></p>
+          <p><a href="team.html" target="_blank">Открыть пульт команды</a></p>
+        </div>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script type="module">
+import { supabase, subscribe, ensureAuth, fetchFacilitatorSnapshot, playSound } from './supabase.js';
+import { EVENT1, EVENT2, AIRCRAFT, escapeHtml } from './game-core.js';
+
+const STAGES = [
+  { id: 'lobby',       label: 'Ожидание' },
+  { id: 'draft',       label: 'Жеребьёвка и выбор самолёта' },
+  { id: 'planning',    label: 'Планирование' },
+  { id: 'event1',      label: 'Событие 1: бросок кубика' },
+  { id: 'event1_resolve', label: 'Событие 1: решения команд' },
+  { id: 'trade',       label: 'Переговоры' },
+  { id: 'event2',      label: 'Событие 2: бросок кубика' },
+  { id: 'event2_resolve', label: 'Событие 2: решения команд' },
+  { id: 'results',     label: 'Итоги' },
+  { id: 'debrief',     label: 'Рефлексия' }
+];
+
+let sessionCode = localStorage.getItem('ae_session_code') || null;
+let currentData = null;
+let timerInterval = null;
+let lastStage = null;
+
+const $ = s => document.querySelector(s);
+
+function setConnected(ok) {
+  const b = $('#connBadge');
+  b.textContent = ok ? 'онлайн' : 'нет связи';
+  b.style.color = ok ? 'var(--ok)' : 'var(--danger)';
+}
+
+async function refresh() {
+  if (!sessionCode) return;
+  currentData = await fetchFacilitatorSnapshot(sessionCode);
+  if (!currentData) { setConnected(false); return; }
+  setConnected(true);
+  render();
+}
+
+function render() {
+  const { session } = currentData;
+  if (session.stage !== lastStage) {
+    if (session.stage === 'trade') $('#timerMin').value = '3';
+    lastStage = session.stage;
+  }
+  const stageIdx = STAGES.findIndex(s => s.id === session.stage);
+
+  if (session.stage === 'lobby') {
+    $('#lobbyScreen').hidden = false;
+    $('#gameScreen').hidden = true;
+    loadSessionInfo();
+    return;
+  }
+
+  $('#lobbyScreen').hidden = true;
+  $('#gameScreen').hidden = false;
+
+  $('#stageLabel').textContent = `Этап ${stageIdx + 1} из ${STAGES.length}`;
+  $('#stageTitle').textContent = STAGES[stageIdx]?.label || session.stage;
+
+  // Кубик
+  const isRollStage = session.stage === 'event1' || session.stage === 'event2';
+  $('#rollBox').hidden = !isRollStage;
+  if (isRollStage) {
+    const rollField = session.stage === 'event1' ? 'event1_roll' : 'event2_roll';
+    const idField = session.stage === 'event1' ? 'event1_id' : 'event2_id';
+    if (session[rollField] != null) {
+      const ev = (session.stage === 'event1' ? EVENT1 : EVENT2)
+        .find(e => e.id === session[idField]);
+      $('#rollResult').innerHTML = `🎲 ${session[rollField]} → <strong>${ev?.title || session[idField]}</strong>`;
+    } else {
+      $('#rollResult').textContent = '';
+    }
+  }
+
+  renderTeams();
+  renderTrades();
+  renderNetworkTimer();
+}
+
+function renderTeams() {
+  const { teams, session, readiness } = currentData;
+  const stageKey = session.stage === 'event1_resolve' ? 'event1'
+    : session.stage === 'event2_resolve' ? 'event2'
+    : session.stage;
+
+  $('#teamsStatus').innerHTML = '<h3>Команды</h3>' + teams
+    .sort((a, b) => (a.draft_position ?? 99) - (b.draft_position ?? 99))
+    .map(t => {
+      const ready = readiness.some(r => r.team_id === t.id && r.stage === stageKey && r.ready);
+      const canReset = ready && ['planning','event1_resolve','event2_resolve'].includes(session.stage);
+      return `<div class="team-row ${ready ? 'done' : ''}">
+        <span class="t-name">${escapeHtml(t.name)}</span>
+        <span class="t-air">${t.aircraft_id ? AIRCRAFT[t.aircraft_id]?.name || t.aircraft_id : '—'}</span>
+        <span class="t-status">${ready ? '✓ отправлено' : 'обсуждает'}</span>
+        ${canReset ? `<button class="btn small" data-reset="${t.id}" data-stage="${stageKey}" title="Вернуть решение">↩</button>` : ''}
+      </div>`;
+    }).join('');
+
+  // Обработчики кнопок возврата решения
+  $('#teamsStatus').querySelectorAll('[data-reset]').forEach(b => b.onclick = async () => {
+    const { error } = await supabase.rpc('reset_team_decision', {
+      p_code: sessionCode, p_team_id: b.dataset.reset, p_stage: b.dataset.stage
+    });
+    if (error) toast(translateError(error.message));
+    else refresh();
+  });
+}
+
+function renderTrades() {
+  const { trades, teams, session } = currentData;
+  const box = $('#tradeReview');
+  if (session.stage === 'trade') {
+    box.hidden = false;
+    const nameOf = id => teams.find(t => t.id === id)?.name || id;
+    $('#tradeList').innerHTML = trades.length
+      ? trades.map(tr => `
+        <div class="trade-row">
+          <span>${escapeHtml(nameOf(tr.initiator_id))} → ${escapeHtml(nameOf(tr.recipient_id))}</span>
+          <span>${tr.item}</span>
+          <span class="badge">${tr.status}</span>
+        </div>`).join('')
+      : '<p class="hint">Сделок пока нет.</p>';
+  } else {
+    box.hidden = true;
+  }
+}
+
+// Сетевой таймер: считается из sessions.timer_ends_at
+function renderNetworkTimer() {
+  const end = currentData?.session?.timer_ends_at;
+  clearInterval(timerInterval);
+  if (!end) { $('#timerDisplay').textContent = '—'; return; }
+  const endTime = new Date(end).getTime();
+  const tick = () => {
+    const left = endTime - Date.now();
+    if (left <= 0) {
+      $('#timerDisplay').textContent = 'время вышло';
+      playSound();
+      clearInterval(timerInterval);
+    } else {
+      const m = Math.floor(left / 60000);
+      const s = Math.floor((left % 60000) / 1000);
+      $('#timerDisplay').textContent = `${m}:${String(s).padStart(2, '0')}`;
+    }
+  };
+  tick();
+  timerInterval = setInterval(tick, 500);
+}
+
+// ---------- Создание сессии ----------
+
+$('#createBtn').onclick = async () => {
+  const names = $('#teamNamesInput').value
+    .split('\n').map(s => s.trim()).filter(Boolean);
+  if (names.length < 2 || names.length > 6) {
+    toast('Укажите от 2 до 6 команд');
+    return;
+  }
+  await ensureAuth();
+  const { data, error } = await supabase.rpc('create_session', { p_team_names: names });
+  if (error) { toast('Ошибка: ' + error.message); return; }
+  sessionCode = data;
+  localStorage.setItem('ae_session_code', sessionCode);
+  $('#screenLink').href = `screen.html?code=${sessionCode}`;
+  await refresh();
+  await loadSessionInfo();
+};
+
+async function loadSessionInfo() {
+  const { data: pins, error } = await supabase.rpc('get_team_pins', { p_code: sessionCode });
+  if (error) { toast('Не удалось получить PIN: ' + translateError(error.message)); return; }
+  $('#sessionInfo').hidden = false;
+  $('#sessionCode').textContent = sessionCode;
+  $('#teamPins').innerHTML = (pins || []).map(p =>
+    `<div>${escapeHtml(p.name)}: PIN <strong>${p.pin}</strong></div>`).join('');
+}
+
+$('#startBtn').onclick = async () => {
+  const { error } = await supabase.rpc('start_game', { p_code: sessionCode });
+  if (error) toast('Ошибка: ' + error.message);
+  else refresh();
+};
+
+// ---------- Управление этапами ----------
+
+$('#nextStageBtn').onclick = async () => {
+  const idx = STAGES.findIndex(s => s.id === currentData.session.stage);
+  const next = STAGES[Math.min(STAGES.length - 1, idx + 1)];
+  const { error } = await supabase.rpc('set_stage', { p_code: sessionCode, p_stage: next.id });
+  if (error) toast(translateError(error.message));
+};
+
+$('#revealBtn').onclick = async () => {
+  const { error } = await supabase.rpc('reveal_results', { p_code: sessionCode });
+  if (error) toast(translateError(error.message));
+};
+
+$('#rollBtn').onclick = async () => {
+  const stage = currentData.session.stage === 'event1' ? 1 : 2;
+  const { error } = await supabase.rpc('roll_event', { p_code: sessionCode, p_stage: stage });
+  if (error) toast('Ошибка кубика: ' + translateError(error.message));
+};
+
+// ---------- Таймер ----------
+
+$('#timerStartBtn').onclick = async () => {
+  const min = +$('#timerMin').value;
+  const { error } = await supabase.rpc('set_timer', { p_code: sessionCode, p_minutes: min });
+  if (error) toast('Ошибка таймера: ' + error.message);
+};
+
+// ---------- Подписки ----------
+
+['sessions', 'teams', 'team_readiness', 'decisions', 'trades', 'session_events'].forEach(t =>
+  subscribe(t, () => refresh())
+);
+setInterval(refresh, 15000);
+
+$('#themeBtn').onclick = () => {
+  const cur = document.documentElement.dataset.theme;
+  document.documentElement.dataset.theme = cur === 'dark' ? 'light' : 'dark';
+};
+
+function translateError(msg) {
+  const m = {
+    SESSION_NOT_FOUND: 'Сессия не найдена',
+    NOT_FACILITATOR: 'Только ведущий может это делать',
+    CANNOT_GO_BACK: 'Нельзя вернуться назад',
+    WRONG_STAGE: 'Сейчас не этот этап',
+    NOT_YOUR_TURN: 'Сейчас не ваша очередь',
+    AIRCRAFT_TAKEN: 'Самолёт уже занят',
+    ALREADY_TRADED: 'Команда уже участвовала в сделке',
+    TRADE_RESOLVED: 'Сделка уже обработана',
+    EVENT_NOT_ROLLED: 'Событие ещё не брошено'
+  };
+  return m[msg] || msg;
+}
+
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+$('#createBtn').disabled = false;
+document.documentElement.dataset.ready = 'true';
+if (sessionCode) {
+  $('#screenLink').href = `screen.html?code=${sessionCode}`;
+  ensureAuth().then(() => refresh()).catch(e => toast(e.message));
+}
+</script>
+</body>
+</html>

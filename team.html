@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Воздушная экспедиция • Пульт команды</title>
+<link rel="stylesheet" href="styles.css">
+<script src="config.js"></script>
+</head>
+<body class="team-page">
+<div class="app team-app">
+  <header class="top">
+    <div class="brand"><span class="logo">✈</span><span>Воздушная экспедиция</span></div>
+    <div class="top-actions">
+      <span class="badge" id="connBadge">подключение…</span>
+      <button class="icon-btn" id="refreshBtn" title="Обновить">🔄</button>
+      <button class="icon-btn" id="soundBtn" title="Включить звук">🔔</button>
+      <button class="icon-btn" id="themeBtn" title="Тема">◐</button>
+    </div>
+  </header>
+
+  <main class="stage team-stage">
+    <div class="timer-strip" id="timerStrip" hidden></div>
+
+    <div class="screen" id="loginScreen">
+      <h2>Вход команды</h2>
+      <div class="field">
+        <label>Код сессии</label>
+        <input id="codeInput" placeholder="Например: A1B2C" autocomplete="off">
+      </div>
+      <div class="field">
+        <label>Название команды</label>
+        <input id="nameInput" placeholder="Как назвала вас команда" autocomplete="off">
+      </div>
+      <div class="field">
+        <label>PIN-код</label>
+        <input id="pinInput" type="password" inputmode="numeric" placeholder="4 цифры" autocomplete="off">
+      </div>
+      <button class="btn primary" id="loginBtn" disabled>Войти</button>
+      <p class="hint" id="loginError"></p>
+    </div>
+
+    <div class="screen" id="gameScreen" hidden>
+      <div class="team-head">
+        <span class="eyebrow" id="stageLabel"></span>
+        <h2 id="stageTitle"></h2>
+        <span class="badge" id="teamBadge"></span>
+      </div>
+      <div class="team-content" id="teamContent"></div>
+    </div>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<style>
+.team-page .stage { padding: 18px; }
+.team-app { min-height: 100dvh; }
+.team-stage { max-width: 640px; margin: 0 auto; width: 100%; }
+.team-head { margin-bottom: 18px; }
+.team-head h2 { font-size: 24px; }
+.timer-strip {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--s2); border-radius: 8px; padding: 8px 14px;
+  font-weight: 800; font-variant-numeric: tabular-nums; margin-bottom: 12px;
+  text-align: center;
+}
+
+.options-grid { display: grid; gap: 10px; margin-top: 14px; }
+.option-card {
+  display: grid; gap: 4px; text-align: left;
+  background: var(--s1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px; min-height: 64px;
+}
+.option-card:disabled { opacity: .45; cursor: not-allowed; }
+.option-card strong { font-size: 17px; }
+.option-card span { font-size: 14px; color: var(--muted); }
+.opt-note { font-size: 12px; color: var(--faint); font-style: italic; }
+
+.event-card {
+  background: color-mix(in oklab, var(--ph) 8%, var(--s1));
+  border: 1px solid color-mix(in oklab, var(--ph) 40%, transparent);
+  border-radius: 12px; padding: 18px;
+}
+.event-card h3 { margin-bottom: 8px; color: var(--ph); }
+
+.choice-made {
+  background: color-mix(in oklab, var(--ok) 12%, var(--s1));
+  border: 1px solid color-mix(in oklab, var(--ok) 45%, transparent);
+  border-radius: 10px; padding: 14px 16px; margin-top: 12px;
+}
+.waiting-box { margin-top: 12px; color: var(--muted); }
+
+.calc-box {
+  margin-top: 14px; background: var(--s2); border-radius: 10px; padding: 14px;
+  display: grid; gap: 6px;
+}
+.calc-box span { color: var(--muted); font-size: 13px; }
+.results-grid { grid-template-columns: 1fr 1fr; }
+.results-grid > div { display: grid; gap: 4px; }
+.results-grid strong { font-size: 24px; line-height: 1.2; }
+
+.debrief-list { margin: 10px 0 0 20px; display: grid; gap: 6px; }
+</style>
+
+<script type="module">
+import { supabase, subscribe, ensureAuth, fetchTeamSnapshot, playSound } from './supabase.js';
+import { AIRCRAFT, ROUTES, PRIORITIES, EVENT1, EVENT2, computeResults, escapeHtml } from './game-core.js';
+
+let sessionCode = null;
+let teamId = null;
+let currentData = null;
+let lastStage = null;
+let soundOn = false;
+let timerInterval = null;
+
+const $ = s => document.querySelector(s);
+
+function setConnected(ok) {
+  const b = $('#connBadge');
+  b.textContent = ok ? 'онлайн' : 'нет связи';
+  b.style.color = ok ? 'var(--ok)' : 'var(--danger)';
+}
+
+async function refresh() {
+  if (!sessionCode || !teamId) return;
+  currentData = await fetchTeamSnapshot(sessionCode);
+  if (!currentData) { setConnected(false); return; }
+  setConnected(true);
+  if (currentData.session.stage !== lastStage) {
+    if (lastStage !== null && soundOn) playSound();
+    lastStage = currentData.session.stage;
+  }
+  render();
+  renderTimer();
+}
+
+function team() {
+  return currentData.teams.find(t => t.id === teamId);
+}
+
+function myDecision(stage) {
+  return currentData.decisions.find(d => d.team_id === teamId && d.stage === stage);
+}
+
+function renderTimer() {
+  clearInterval(timerInterval);
+  const end = currentData?.session?.timer_ends_at;
+  const el = $('#timerStrip');
+  if (!end) { el.hidden = true; return; }
+  el.hidden = false;
+  const endTime = new Date(end).getTime();
+  const tick = () => {
+    const left = endTime - Date.now();
+    if (left <= 0) { el.textContent = '⏰ время вышло'; clearInterval(timerInterval); return; }
+    const m = Math.floor(left / 60000);
+    const s = Math.floor((left % 60000) / 1000);
+    el.textContent = `⏱ ${m}:${String(s).padStart(2, '0')}`;
+  };
+  tick();
+  timerInterval = setInterval(tick, 500);
+}
+
+function render() {
+  const t = team();
+  if (!t) { $('#loginError').textContent = 'Команда не найдена в сессии'; return; }
+
+  $('#loginScreen').hidden = true;
+  $('#gameScreen').hidden = false;
+  $('#teamBadge').textContent = t.name;
+
+  const s = currentData.session.stage;
+  const map = {
+    lobby: 'Ожидание начала',
+    draft: 'Выбор самолёта',
+    planning: 'Планирование миссии',
+    event1: 'Событие 1: ждём кубик',
+    event1_resolve: 'Событие 1: ваше решение',
+    trade: 'Переговоры',
+    event2: 'Событие 2: ждём кубик',
+    event2_resolve: 'Событие 2: ваше решение',
+    results: 'Итоги миссии',
+    debrief: 'Рефлексия'
+  };
+  $('#stageLabel').textContent = 'Текущий этап';
+  $('#stageTitle').textContent = map[s] || s;
+
+  const box = $('#teamContent');
+  if (s === 'draft') renderDraft(t, box);
+  else if (s === 'planning') renderPlanning(t, box);
+  else if (s === 'event1_resolve') renderEvent1(t, box);
+  else if (s === 'trade') renderTrade(t, box);
+  else if (s === 'event2_resolve') renderEvent2(t, box);
+  else if (s === 'results' || s === 'debrief') renderResults(t, box);
+  else renderWaiting(t, box);
+}
+
+function renderWaiting(t, box) {
+  const s = currentData.session.stage;
+  const rollField = s === 'event1' ? 'event1_roll' : s === 'event2' ? 'event2_roll' : null;
+  let html = '<p class="hint">Ожидайте команды ведущего.</p>';
+  if (rollField && currentData.session[rollField] != null) {
+    html = `<div class="event-card"><p>🎲 Кубик: <strong>${currentData.session[rollField]}</strong></p></div>`;
+  }
+  box.innerHTML = html;
+}
+
+// ---------- Драфт ----------
+
+function renderDraft(t, box) {
+  const teams = currentData.teams.slice().sort((a, b) => (a.draft_position ?? 99) - (b.draft_position ?? 99));
+  const currentPickerPos = currentData.session.current_picker + 1;
+  const isMyTurn = t.draft_position === currentPickerPos;
+
+  const available = Object.keys(AIRCRAFT).slice(0, currentData.teams.length);
+  const taken = new Set(currentData.teams.map(x => x.aircraft_id).filter(Boolean));
+
+  let html = `<p class="hint">Ваша позиция в очереди: <strong>${t.draft_position}</strong>. Сейчас выбирает: <strong>${currentPickerPos}</strong>.</p>`;
+
+  if (t.aircraft_id) {
+    html += `<div class="choice-made">Вы выбрали: <strong>${AIRCRAFT[t.aircraft_id].name}</strong></div>`;
+  } else if (!isMyTurn) {
+    html += '<div class="waiting-box">Ждите своей очереди.</div>';
+  } else {
+    html += '<div class="options-grid">' + available.map(k => {
+      const a = AIRCRAFT[k];
+      const disabled = taken.has(k) ? 'disabled' : '';
+      return `<button class="option-card" data-air="${k}" ${disabled}>
+        <strong>${a.name}</strong>
+        <span>Вместимость ${a.capacity} • Цена ${a.cost} • Время ${a.time} • Защита ${a.defense}</span>
+        <span class="opt-note">${a.note}</span>
+      </button>`;
+    }).join('') + '</div>';
+  }
+
+  box.innerHTML = html;
+  box.querySelectorAll('[data-air]').forEach(b => b.onclick = async () => {
+    const { error } = await supabase.rpc('pick_aircraft', {
+      p_code: sessionCode, p_aircraft: b.dataset.air
+    });
+    if (error) toast(translateError(error.message));
+    else refresh();
+  });
+}
+
+// ---------- Планирование ----------
+
+// Черновик плана: сохраняем между обновлениями
+let planningDraft = null;
+
+function renderPlanning(t, box) {
+  const dec = myDecision('planning');
+  if (dec) {
+    planningDraft = null;
+    box.innerHTML = `<div class="choice-made">Решение отправлено. Ожидайте события.</div>`;
+    return;
+  }
+
+  // Не пересоздаём форму, если она уже есть (сохраняем черновик)
+  if (box.querySelector('#routeSel')) {
+    // Форма уже существует — только обновляем превью
+    const st = readPlan();
+    const res = computeResults({
+      aircraftId: t.aircraft_id, routeId: st.routeId, baseCargo: st.cargoId || null,
+      event1Choice: null, event2Choice: null, tradeDirection: null,
+      droppedCargoItem: null
+    });
+    const preview = box.querySelector('#planPreview');
+    if (preview) {
+      preview.innerHTML = `
+        <span>Загрузка: ${res.load}/${res.capacity}</span>
+        <span>Резерв: ${res.resources}</span>
+        <span>Время: ${res.time}</span>
+        <span>${res.valid ? 'план допустим' : 'недопустимо: перегруз или нет ресурса'}</span>`;
+    }
+    return;
+  }
+
+  box.innerHTML = `
+    <div class="field"><label>Маршрут</label>
+      <select id="routeSel">${Object.entries(ROUTES).map(([k, r]) =>
+        `<option value="${k}">${r.name} — цена ${r.cost}, время ${r.time}, экспозиция ${r.exposure}</option>`).join('')}
+      </select></div>
+    <div class="field"><label>Дополнительный груз</label>
+      <select id="cargoSel">
+        <option value="">Нет</option>
+        <option value="sensors">Датчики (+1 миссия, 1 место)</option>
+        <option value="repair">Ремкомплект (+1 безопасность, 1 место)</option>
+      </select></div>
+    <div class="field"><label>Приоритет команды</label>
+      <select id="prioSel">${PRIORITIES.map(p => `<option>${p}</option>`).join('')}</select></div>
+    <button class="btn primary" id="submitPlan">Отправить решение</button>
+    <div id="planPreview" class="calc-box"></div>`;
+
+  const update = () => {
+    const st = readPlan();
+    const res = computeResults({
+      aircraftId: t.aircraft_id, routeId: st.routeId, baseCargo: st.cargoId || null,
+      event1Choice: null, event2Choice: null, tradeDirection: null,
+      droppedCargoItem: null
+    });
+    $('#planPreview').innerHTML = `
+      <span>Загрузка: ${res.load}/${res.capacity}</span>
+      <span>Резерв: ${res.resources}</span>
+      <span>Время: ${res.time}</span>
+      <span>${res.valid ? 'план допустим' : 'недопустимо: перегруз или нет ресурса'}</span>`;
+  };
+  ['routeSel', 'cargoSel', 'prioSel'].forEach(id => {
+    $('#' + id).onchange = () => {
+      planningDraft = readPlan(); // сохраняем черновик
+      update();
+    };
+  });
+  // Восстанавливаем черновик
+  if (planningDraft) {
+    if (planningDraft.routeId) $('#routeSel').value = planningDraft.routeId;
+    if (planningDraft.cargoId) $('#cargoSel').value = planningDraft.cargoId;
+    if (planningDraft.priority) $('#prioSel').value = planningDraft.priority;
+  }
+  update();
+
+  $('#submitPlan').onclick = async () => {
+    const st = readPlan();
+    const { error } = await supabase.rpc('submit_decision', {
+      p_code: sessionCode, p_stage: 'planning', p_payload: st
+    });
+    if (error) toast(translateError(error.message));
+    else { planningDraft = null; refresh(); }
+  };
+}
+
+function readPlan() {
+  return {
+    routeId: $('#routeSel').value,
+    cargoId: $('#cargoSel').value || null,
+    priority: $('#prioSel').value
+  };
+}
+
+// ---------- Событие 1 ----------
+
+function renderEvent1(t, box) {
+  const ev = EVENT1.find(e => e.id === currentData.session.event1_id);
+  const dec = myDecision('event1');
+  if (dec) {
+    const label = ev?.options.find(o => o.id === dec.payload.event1Choice)?.label || dec.payload.event1Choice;
+    box.innerHTML = `<div class="choice-made">Решение отправлено: ${label}</div>`;
+    return;
+  }
+  if (!ev) { box.innerHTML = '<p class="hint">Событие ещё не выбрано.</p>'; return; }
+
+  box.innerHTML = `
+    <div class="event-card">
+      <h3>${ev.title}</h3>
+      <p>${ev.text}</p>
+      <div class="options-grid">
+        ${ev.options.map(o => `<button class="option-card" data-ev1="${o.id}">
+          <strong>${o.label}</strong><span>${o.hint}</span>
+        </button>`).join('')}
+      </div>
+    </div>`;
+
+  box.querySelectorAll('[data-ev1]').forEach(b => b.onclick = async () => {
+    const { error } = await supabase.rpc('submit_decision', {
+      p_code: sessionCode, p_stage: 'event1',
+      p_payload: { event1Choice: b.dataset.ev1, event1Id: ev.id }
+    });
+    if (error) toast(translateError(error.message));
+    else refresh();
+  });
+}
+
+// ---------- Переговоры ----------
+
+function renderTrade(t, box) {
+  const myTrade = currentData.trades.find(tr =>
+    tr.status === 'proposed' && tr.recipient_id === teamId);
+  const participated = currentData.trades.some(tr =>
+    tr.status === 'accepted' &&
+    (tr.initiator_id === teamId || tr.recipient_id === teamId));
+
+  let html = '<p class="hint">Каждая команда может участвовать в одной сделке. Сделка стоит обеим сторонам +1 время.</p>';
+
+  if (participated) {
+    html += '<div class="choice-made">Вы уже участвовали в сделке.</div>';
+  } else if (myTrade) {
+    const nameOf = currentData.teams.find(x => x.id === myTrade.initiator_id)?.name;
+    html += `
+      <div class="event-card">
+        <h3>Вам предложили сделку</h3>
+        <p>От команды <strong>${escapeHtml(nameOf)}</strong>. Предмет: <strong>${myTrade.item}</strong>.</p>
+        <div class="controls">
+          <button class="btn primary" id="acceptTrade">Принять</button>
+          <button class="btn" id="declineTrade">Отклонить</button>
+        </div>
+      </div>`;
+  } else {
+    const others = currentData.teams.filter(x => x.id !== teamId &&
+      !currentData.trades.some(tr => tr.status === 'accepted' &&
+        (tr.initiator_id === x.id || tr.recipient_id === x.id)));
+    html += `
+      <div class="field"><label>Команда-партнёр</label>
+        <select id="tradePartner">${others.map(x => `<option value="${x.id}">${escapeHtml(x.name)}</option>`).join('')}</select>
+      </div>
+      <div class="field"><label>Что передаём</label>
+        <select id="tradeItem">
+          <option value="resource">1 ресурс</option>
+          <option value="sensors">Датчики</option>
+          <option value="repair">Ремкомплект</option>
+        </select>
+      </div>
+      <button class="btn primary" id="proposeTrade">Предложить сделку</button>`;
+  }
+
+  box.innerHTML = html;
+
+  const acc = $('#acceptTrade');
+  if (acc) acc.onclick = async () => {
+    const { error } = await supabase.rpc('resolve_trade', { p_trade_id: myTrade.id, p_accept: true });
+    if (error) toast(translateError(error.message)); else refresh();
+  };
+  const dec = $('#declineTrade');
+  if (dec) dec.onclick = async () => {
+    const { error } = await supabase.rpc('resolve_trade', { p_trade_id: myTrade.id, p_accept: false });
+    if (error) toast(translateError(error.message)); else refresh();
+  };
+  const prop = $('#proposeTrade');
+  if (prop) prop.onclick = async () => {
+    const { error } = await supabase.rpc('propose_trade', {
+      p_code: sessionCode,
+      p_recipient: $('#tradePartner').value,
+      p_item: $('#tradeItem').value
+    });
+    if (error) toast(translateError(error.message));
+    else { toast('Предложение отправлено'); refresh(); }
+  };
+}
+
+// ---------- Событие 2 ----------
+
+function renderEvent2(t, box) {
+  const ev = EVENT2.find(e => e.id === currentData.session.event2_id);
+  const dec = myDecision('event2');
+  if (dec) {
+    box.innerHTML = `<div class="choice-made">Решение отправлено.</div>`;
+    return;
+  }
+  if (!ev) { box.innerHTML = '<p class="hint">Событие ещё не выбрано.</p>'; return; }
+
+  const selectedDrop = box.querySelector('#dropCargo')?.value || '';
+  const plan = myDecision('planning')?.payload || {};
+  // Фактическый инвентарь после сделки
+  const accepted = currentData.trades.find(tr => tr.status === 'accepted' &&
+    (tr.initiator_id === teamId || tr.recipient_id === teamId));
+
+  let sensorCount = plan.cargoId === 'sensors' ? 1 : 0;
+  let repairCount = plan.cargoId === 'repair' ? 1 : 0;
+  if (accepted) {
+    if (accepted.initiator_id === teamId) {
+      // передали
+      if (accepted.item === 'sensors') sensorCount = Math.max(0, sensorCount - 1);
+      if (accepted.item === 'repair') repairCount = Math.max(0, repairCount - 1);
+    } else {
+      // получили
+      if (accepted.item === 'sensors') sensorCount += 1;
+      if (accepted.item === 'repair') repairCount += 1;
+    }
+  }
+
+  const isMed = ev.id === 'e2a';
+  // какой груз можно снять (по фактическому инвентарю)
+  const droppable = [
+    ...(sensorCount > 0 ? [{ id: 'sensors', name: 'Датчики' }] : []),
+    ...(repairCount > 0 ? [{ id: 'repair', name: 'Ремкомплект' }] : [])
+  ];
+
+  box.innerHTML = `
+    <div class="event-card">
+      <h3>${ev.title}</h3>
+      <p>${ev.text}</p>
+      ${isMed && droppable.length ? `
+        <div class="field"><label for="dropCargo">Освободить место под медгруз</label>
+        <select id="dropCargo"><option value="">Ничего не снимать</option>
+          ${droppable.map(c => `<option value="${c.id}">Снять: ${c.name}</option>`).join('')}
+        </select></div>` : ''}
+      <div class="options-grid">
+        ${ev.options.map(o => `<button class="option-card" data-ev2="${o.id}">
+          <strong>${o.label}</strong><span>${o.hint}</span>
+        </button>`).join('')}
+      </div>
+    </div>`;
+
+  if (box.querySelector('#dropCargo') && droppable.some(c => c.id === selectedDrop)) {
+    box.querySelector('#dropCargo').value = selectedDrop;
+  }
+  box.querySelectorAll('[data-ev2]').forEach(b => b.onclick = async () => {
+    const payload = {
+      event2Choice: b.dataset.ev2,
+      event2Id: ev.id
+    };
+    if (isMed && b.dataset.ev2 === 'accept' && $('#dropCargo')?.value) {
+      payload.droppedCargoItem = $('#dropCargo').value;
+    }
+    const { error } = await supabase.rpc('submit_decision', {
+      p_code: sessionCode, p_stage: 'event2', p_payload: payload
+    });
+    if (error) toast(translateError(error.message));
+    else refresh();
+  });
+}
+
+// ---------- Итоги ----------
+
+function renderResults(t, box) {
+  const plan = myDecision('planning')?.payload || {};
+  const e1 = myDecision('event1')?.payload || {};
+  const e2 = myDecision('event2')?.payload || {};
+  const accepted = currentData.trades.find(tr => tr.status === 'accepted' &&
+    (tr.initiator_id === teamId || tr.recipient_id === teamId));
+
+  const state = {
+    aircraftId: t.aircraft_id,
+    routeId: plan.routeId,
+    baseCargo: plan.cargoId || null,
+    event1Id: e1.event1Id, event1Choice: e1.event1Choice,
+    event2Id: e2.event2Id, event2Choice: e2.event2Choice,
+    droppedCargoItem: e2.droppedCargoItem || null,
+    tradeDirection: accepted ? (accepted.initiator_id === teamId ? 'give' : 'receive') : null,
+    tradeItem: accepted?.item || null
+  };
+
+  const r = computeResults(state);
+  box.innerHTML = `
+    <div class="calc-box results-grid">
+      <div><span>Миссия</span><strong>${r.mission}</strong></div>
+      <div><span>Безопасность</span><strong>${r.safety}</strong></div>
+      <div><span>Резерв</span><strong>${r.resources}</strong></div>
+      <div><span>Время</span><strong>${r.time}</strong></div>
+    </div>
+    <p class="hint">Загрузка: ${r.load}/${r.capacity} • ${r.valid ? 'план допустим' : 'план недопустим'}</p>
+    ${currentData.session.stage === 'debrief' ? `
+      <div class="event-card">
+        <h3>Вопросы для обсуждения</h3>
+        <ul class="debrief-list">
+          <li>Какой ресурс оказался для вас дефицитным?</li>
+          <li>В какой момент план перестал быть лучшим?</li>
+          <li>Почему вы заключили или не заключили сделку?</li>
+          <li>Была ли цена +1 времени оправданной?</li>
+          <li>Что вы изменили бы при повторе?</li>
+        </ul>
+      </div>` : ''}`;
+}
+
+// ---------- Вход ----------
+
+$('#loginBtn').onclick = async () => {
+  const code = $('#codeInput').value.trim().toUpperCase();
+  const name = $('#nameInput').value.trim();
+  const pin = $('#pinInput').value.trim();
+  if (!code || !name || !pin) { $('#loginError').textContent = 'Заполните все поля'; return; }
+
+  await ensureAuth();
+  const { data, error } = await supabase.rpc('join_team', { p_code: code, p_name: name, p_pin: pin });
+  if (error) {
+    $('#loginError').textContent = translateError(error.message);
+    return;
+  }
+  // join_team возвращает team_id напрямую — присваиваем до refresh
+  teamId = data;
+  sessionCode = code;
+  sessionStorage.setItem('ae_team_code', code);
+  if (teamId) sessionStorage.setItem('ae_team_id', teamId);
+  await refresh();
+};
+
+function translateError(msg) {
+  const m = {
+    SESSION_NOT_FOUND: 'Сессия не найдена',
+    TEAM_NOT_FOUND: 'Команда не найдена',
+    WRONG_PIN: 'Неверный PIN',
+    NOT_AUTHENTICATED: 'Не удалось войти. Обновите страницу.',
+    WRONG_STAGE: 'Сейчас не этот этап',
+    NOT_YOUR_TURN: 'Сейчас не ваша очередь',
+    AIRCRAFT_TAKEN: 'Самолёт уже занят',
+    ALREADY_TRADED: 'Команда уже участвовала в сделке',
+    TRADE_RESOLVED: 'Сделка уже обработана',
+    EVENT_NOT_ROLLED: 'Событие ещё не брошено',
+    ALREADY_SUBMITTED: 'Решение уже отправлено. Для исправления обратитесь к ведущему.',
+    INVALID_CARGO_DROP: 'Этот груз нельзя снять',
+    DO_NOT_HAVE_ITEM: 'У команды нет выбранного предмета',
+    CANNOT_TRADE_WITH_SELF: 'Нельзя заключить сделку с самим собой'
+  };
+  if (msg.startsWith('INVALID_PLAN')) return 'План недопустим: ' + msg.replace('INVALID_PLAN: ', '');
+  return m[msg] || msg;
+}
+
+// ---------- Подписки ----------
+
+['sessions', 'teams', 'team_readiness', 'decisions', 'trades'].forEach(t =>
+  subscribe(t, () => refresh())
+);
+setInterval(refresh, 15000);
+
+$('#refreshBtn').onclick = refresh;
+$('#soundBtn').onclick = () => {
+  soundOn = !soundOn;
+  $('#soundBtn').style.color = soundOn ? 'var(--ok)' : '';
+  if (soundOn) playSound();
+};
+$('#themeBtn').onclick = () => {
+  const cur = document.documentElement.dataset.theme;
+  document.documentElement.dataset.theme = cur === 'dark' ? 'light' : 'dark';
+};
+
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+// Восстановление после обновления страницы: получаем привязку с сервера
+$('#loginBtn').disabled = false;
+document.documentElement.dataset.ready = 'true';
+(async () => {
+  const savedCode = sessionStorage.getItem('ae_team_code');
+  if (!savedCode) return;
+  sessionCode = savedCode;
+  try {
+    await ensureAuth();
+    // Сначала получаем серверную привязку, потом обновляем состояние
+    const { data: serverTeamId, error } = await supabase.rpc('get_my_team', { p_code: sessionCode });
+    if (error || !serverTeamId) {
+      // Нет активной привязки — показываем экран входа
+      return;
+    }
+    teamId = serverTeamId;
+    sessionStorage.setItem('ae_team_id', teamId);
+    await refresh();
+  } catch (e) {
+    $('#loginError').textContent = e.message;
+  }
+})();
+</script>
+</body>
+</html>

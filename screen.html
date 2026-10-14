@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Воздушная экспедиция • Экран</title>
+<link rel="stylesheet" href="styles.css">
+<script src="config.js"></script>
+<style>
+.screen-page .stage { padding: 32px; max-width: 1200px; width: 100%; margin: 0 auto; }
+.table-wrap { width: 100%; overflow-x: auto; }
+.proj-head { margin-bottom: 24px; }
+.proj-head .eyebrow { font-size: 15px; }
+.proj-head h1 { font-size: clamp(32px, 5vw, 56px); line-height: 1.05; }
+.lead { font-size: clamp(18px, 2.4vw, 26px); color: var(--muted); max-width: 52ch; margin-top: 12px; }
+
+.timer-big {
+  position: fixed; top: 20px; right: 24px;
+  font-size: 40px; font-weight: 900; font-variant-numeric: tabular-nums;
+  background: var(--s1); border: 1px solid var(--border); border-radius: 12px;
+  padding: 8px 20px; z-index: 10;
+}
+
+.team-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin-top: 20px; }
+.team-card {
+  background: var(--s1); border: 1px solid var(--border); border-radius: 12px;
+  padding: 16px; display: grid; gap: 6px;
+}
+.team-card.ready { border-color: var(--ok); }
+.team-card .t-name { font-weight: 800; font-size: 18px; }
+.team-card .t-sub { color: var(--muted); font-size: 14px; }
+
+.order-list { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 20px; }
+.order-chip {
+  background: var(--s1); border: 1px solid var(--border); border-radius: 999px;
+  padding: 10px 18px; font-weight: 800; font-size: 18px;
+}
+
+.event-big {
+  margin-top: 24px; background: color-mix(in oklab, var(--ph) 8%, var(--s1));
+  border: 1px solid color-mix(in oklab, var(--ph) 40%, transparent);
+  border-radius: 16px; padding: 28px;
+}
+.event-big h2 { color: var(--ph); font-size: clamp(26px, 3vw, 40px); }
+.event-big .roll { font-size: 60px; margin-right: 14px; }
+
+.scoreboard { width: 100%; border-collapse: separate; border-spacing: 0 10px; margin-top: 20px; }
+.scoreboard th { text-align: left; color: var(--muted); font-size: 14px; padding: 0 12px; }
+.scoreboard td {
+  background: var(--s1); padding: 16px 12px; font-size: 18px;
+  border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.scoreboard td:first-child { border-left: 1px solid var(--border); border-radius: 12px 0 0 12px; }
+.scoreboard td:last-child { border-right: 1px solid var(--border); border-radius: 0 12px 12px 0; }
+
+.debrief-list { margin-top: 20px; display: grid; gap: 14px; }
+.debrief-item {
+  background: var(--s1); border: 1px solid var(--border); border-radius: 12px;
+  padding: 18px; font-size: 20px;
+}
+</style>
+</head>
+<body class="screen-page">
+<div class="app">
+  <header class="top">
+    <div class="brand"><span class="logo">✈</span><span>Воздушная экспедиция</span></div>
+    <div class="top-actions">
+      <span class="badge" id="connBadge">подключение…</span>
+      <button class="icon-btn" id="refreshBtn">🔄</button>
+      <button class="icon-btn" id="themeBtn">◐</button>
+    </div>
+  </header>
+
+  <main class="stage">
+    <div class="timer-big" id="timerBig" hidden>—</div>
+    <div id="screenContent"></div>
+  </main>
+</div>
+
+<script type="module">
+import { supabase, subscribe, ensureAuth, fetchPublicSnapshot } from './supabase.js';
+import { AIRCRAFT, ROUTES, EVENT1, EVENT2, escapeHtml } from './game-core.js';
+
+const params = new URLSearchParams(location.search);
+let sessionCode = params.get('code') || localStorage.getItem('ae_screen_code');
+if (sessionCode) localStorage.setItem('ae_screen_code', sessionCode);
+
+let currentData = null;
+let timerInterval = null;
+const $ = s => document.querySelector(s);
+
+function setConnected(ok) {
+  const b = $('#connBadge');
+  b.textContent = ok ? 'онлайн' : 'нет связи';
+  b.style.color = ok ? 'var(--ok)' : 'var(--danger)';
+}
+
+async function refresh() {
+  if (!sessionCode) {
+    $('#screenContent').innerHTML = '<h1>Укажите код сессии</h1><p class="lead">Откройте страницу с параметром: screen.html?code=XXXXX</p>';
+    return;
+  }
+  currentData = await fetchPublicSnapshot(sessionCode);
+  if (!currentData) { setConnected(false); return; }
+  setConnected(true);
+  render();
+  renderTimer();
+}
+
+function renderTimer() {
+  clearInterval(timerInterval);
+  const end = currentData?.session?.timer_ends_at;
+  const el = $('#timerBig');
+  if (!end) { el.hidden = true; return; }
+  el.hidden = false;
+  const endTime = new Date(end).getTime();
+  const tick = () => {
+    const left = endTime - Date.now();
+    if (left <= 0) { el.textContent = '⏰'; return; }
+    const m = Math.floor(left / 60000);
+    const s = Math.floor((left % 60000) / 1000);
+    el.textContent = `${m}:${String(s).padStart(2, '0')}`;
+  };
+  tick();
+  timerInterval = setInterval(tick, 500);
+}
+
+function isReady(teamId, stageKey) {
+  return currentData.readiness.some(r => r.team_id === teamId && r.stage === stageKey && r.ready);
+}
+
+function render() {
+  const { session, teams } = currentData;
+  const s = session.stage;
+  const box = $('#screenContent');
+
+  if (s === 'lobby') {
+    box.innerHTML = `
+      <div class="proj-head">
+        <div class="eyebrow">Командная экспедиция</div>
+        <h1>Северная станция</h1>
+        <p class="lead">Доставьте обязательный груз, сохраните резерв и скоординируйтесь с другими экипажами.</p>
+      </div>`;
+    return;
+  }
+
+  if (s === 'draft') {
+    const sorted = teams.slice().sort((a, b) => (a.draft_position ?? 99) - (b.draft_position ?? 99));
+    const picker = sorted[session.current_picker];
+    box.innerHTML = `
+      <div class="proj-head">
+        <div class="eyebrow">Жеребьёвка</div>
+        <h1>Порядок выбора самолётов</h1>
+      </div>
+      <div class="order-list">${sorted.map((t, i) =>
+        `<span class="order-chip">${i + 1}. ${escapeHtml(t.name)}${t.aircraft_id ? ` — ${AIRCRAFT[t.aircraft_id].name}` : ''}</span>`
+      ).join('')}</div>
+      <p class="lead" style="margin-top:24px">Сейчас выбирает: <strong>${escapeHtml(picker?.name || '—')}</strong></p>`;
+    return;
+  }
+
+  if (s === 'planning') {
+    box.innerHTML = `
+      <div class="proj-head">
+        <div class="eyebrow">Планирование</div>
+        <h1>Соберите исходный план</h1>
+      </div>
+      <div class="team-grid">${teams.map(t =>
+        `<div class="team-card ${isReady(t.id, 'planning') ? 'ready' : ''}">
+          <span class="t-name">${escapeHtml(t.name)}</span>
+          <span class="t-sub">${t.aircraft_id ? AIRCRAFT[t.aircraft_id].name : 'самолёт не выбран'}</span>
+          <span class="t-sub">${isReady(t.id, 'planning') ? '✓ план отправлен' : 'обсуждает'}</span>
+        </div>`).join('')}</div>`;
+    return;
+  }
+
+  if (s === 'event1' || s === 'event2') {
+    const isE1 = s === 'event1';
+    const evId = isE1 ? session.event1_id : session.event2_id;
+    const roll = isE1 ? session.event1_roll : session.event2_roll;
+    const ev = (isE1 ? EVENT1 : EVENT2).find(e => e.id === evId);
+    box.innerHTML = `
+      <div class="proj-head">
+        <div class="eyebrow">Событие ${isE1 ? '1' : '2'}</div>
+        <h1>${ev ? ev.title : 'Бросаем кубик'}</h1>
+      </div>
+      ${roll != null ? `<div class="event-big">
+        <span class="roll">🎲 ${roll}</span>
+        <h2>${ev?.title}</h2>
+        <p class="lead">${ev?.text}</p>
+      </div>` : '<p class="lead">Ведущий бросает кубик…</p>'}`;
+    return;
+  }
+
+  if (s === 'event1_resolve' || s === 'event2_resolve') {
+    const isE1 = s === 'event1_resolve';
+    const stageKey = isE1 ? 'event1' : 'event2';
+    const evId = isE1 ? session.event1_id : session.event2_id;
+    const ev = (isE1 ? EVENT1 : EVENT2).find(e => e.id === evId);
+    // Показываем опубликованные результаты (если ведущий нажал «Показать последствия»)
+    const published = currentData.published || [];
+    const latestPublished = published.filter(p => p.stage === s);
+    box.innerHTML = `
+      <div class="proj-head">
+        <div class="eyebrow">Событие ${isE1 ? '1' : '2'} — решения</div>
+        <h1>${ev?.title || ''}</h1>
+      </div>
+      <div class="team-grid">${teams.map(t =>
+        `<div class="team-card ${isReady(t.id, stageKey) ? 'ready' : ''}">
+          <span class="t-name">${escapeHtml(t.name)}</span>
+          <span class="t-sub">${isReady(t.id, stageKey) ? '✓ решение принято' : 'обсуждает'}</span>
+        </div>`).join('')}</div>
+      ${latestPublished.length > 0
+        ? renderPublishedTable(latestPublished)
+        : '<p class="lead">Ведущий может раскрыть промежуточные последствия кнопкой «Показать последствия».</p>'}`;
+    return;
+  }
+
+  if (s === 'trade') {
+    box.innerHTML = `
+      <div class="proj-head">
+        <div class="eyebrow">Общее окно</div>
+        <h1>Переговоры между командами</h1>
+      </div>
+      <p class="lead">Каждая команда может заключить одну сделку. Обе стороны получают +1 время.</p>
+      <p class="lead">Команды договариваются устно и подтверждают сделку на пульте.</p>`;
+    return;
+  }
+
+  if (s === 'results' || s === 'debrief') {
+    // Опубликованные результаты доступны проектору через RLS (published_results)
+    // Показываем таблицу, если ведущий нажал «Показать последствия»
+    const published = currentData.published || [];
+    const latestPublished = published.filter(p => p.stage === s);
+
+    if (s === 'debrief') {
+      box.innerHTML = `
+        <div class="proj-head">
+          <div class="eyebrow">Рефлексия</div>
+          <h1>Объясните решение</h1>
+        </div>
+        ${latestPublished.length > 0 ? renderPublishedTable(latestPublished) : ''}
+        <div class="debrief-list">
+          <div class="debrief-item">Что было вашим главным приоритетом?</div>
+          <div class="debrief-item">Как первое событие изменило план?</div>
+          <div class="debrief-item">Зачем вы заключили или отклонили сделку?</div>
+          <div class="debrief-item">Была ли цена +1 времени оправданной?</div>
+          <div class="debrief-item">Что вы изменили бы при повторе?</div>
+        </div>`;
+    } else {
+      box.innerHTML = `
+        <div class="proj-head">
+          <div class="eyebrow">Итоги</div>
+          <h1>Миссия завершена</h1>
+          <p class="lead">Профиль показывает сильные и слабые стороны стратегии, а не одно место в рейтинге.</p>
+        </div>
+        ${latestPublished.length > 0
+          ? renderPublishedTable(latestPublished)
+          : '<p class="lead">Ведущий раскроет результаты кнопкой «Показать последствия».</p>'}`;
+    }
+    return;
+  }
+}
+
+function renderPublishedTable(published) {
+  const teams = currentData.teams;
+  const nameOf = id => teams.find(t => t.id === id)?.name || id;
+  return `
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Таблица результатов, прокрутка по горизонтали">
+    <table class="scoreboard">
+      <thead><tr>
+        <th>Команда</th><th>Самолёт</th><th>Маршрут</th>
+        <th>Миссия</th><th>Безопасность</th><th>Резерв</th><th>Время</th><th>Сделка</th>
+      </tr></thead>
+      <tbody>${published.map(p => `
+        <tr>
+          <td><strong>${escapeHtml(nameOf(p.team_id))}</strong><br><span class="t-sub">${escapeHtml(p.priority || '')}</span></td>
+          <td>${p.aircraft_id ? AIRCRAFT[p.aircraft_id].name : '—'}</td>
+          <td>${p.route_id ? ROUTES[p.route_id].name : '—'}</td>
+          <td>${p.mission ?? '—'}</td><td>${p.safety ?? '—'}</td>
+          <td>${p.resources ?? '—'}</td><td>${p.time ?? '—'}</td>
+          <td>${p.traded ? 'да · +1 время' : '—'}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table></div>`;
+}
+
+['sessions', 'teams', 'team_readiness', 'published_results', 'session_events'].forEach(t =>
+  subscribe(t, () => refresh())
+);
+setInterval(refresh, 15000);
+$('#refreshBtn').onclick = refresh;
+$('#themeBtn').onclick = () => {
+  const cur = document.documentElement.dataset.theme;
+  document.documentElement.dataset.theme = cur === 'dark' ? 'light' : 'dark';
+};
+
+ensureAuth().then(() => refresh()).catch(e => {
+  $('#screenContent').innerHTML = `<h1>Ошибка подключения</h1><p class="lead">${e.message}</p>`;
+});
+</script>
+</body>
+</html>
